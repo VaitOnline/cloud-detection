@@ -1,0 +1,10 @@
+# ID and API keys
+.env
+
+# Data
+*.nc
+data/
+
+# Python cache
+__pycache__/
+.venv/
