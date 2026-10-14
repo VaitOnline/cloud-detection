@@ -2,6 +2,7 @@ import numpy as np
 import os
 import zipfile
 import glob
+import xarray as xr
 
 from typing import List, Tuple, Optional
 from satpy import Scene
@@ -127,6 +128,34 @@ def process_seviri(self, seviri_path: str) -> np.ndarray:
 
     # Final shape: (3, 15, 15)
     return np.stack([vis006, vis008, ir016])
+
+
+def append_sample(self, timestamp: str, image_data: np.ndarray, mask_data: np.ndarray):
+    """
+    Add the resampled and aligned data in the Zarr file.
+    """
+
+    ds = xr.Dataset(
+        data_vars={
+            "image": (["time", "channel", "y", "x"], image_data[None, ...]),    # Add 1D in front of the data to fit the dictionnary format (time)
+            "mask": (["time", "y", "x"], mask_data[None, ...])
+        },
+        coords={
+            "time":[np.datetime64(timestamp)],
+            "channel": ["VIS006", "VIS008", "IR_016"],
+            "y": np.arrange(self.shape[0]),
+            "x": np.arrange(self.shape[1])
+        }
+    )
+
+    mode = "a" if os.path.exists(self.zarr_path) else "w"   # Append if file already exists and write otherwise (create)
+    kwargs = {"append_dim": "time"} if mode == "a" else {}  # Add data by enlarging the time dimension
+
+    ds.to_zarr(self.zarr_path, mode=mode, **kwargs)
+
+
+
+
 
 
 
