@@ -131,26 +131,30 @@ class EumetsatZarrPipeline:
         return np.stack([vis006, vis008, ir016])
 
 
-    def append_sample(self, timestamp: str, image_data: np.ndarray, mask_data: np.ndarray):
+    def append_sample(self, timestamp: str,roi_name: str, image_data: np.ndarray, mask_data: np.ndarray):
         """
         Add the resampled and aligned data in the Zarr file.
         """
 
+        sample_id = f"{timestamp}_{roi_name}"
+
         ds = xr.Dataset(
             data_vars={
-                "image": (["time", "channel", "y", "x"], image_data[None, ...]),    # Add 1D in front of the data to fit the dictionnary format (time)
-                "mask": (["time", "y", "x"], mask_data[None, ...])
+                "image": (["sample", "channel", "y", "x"], image_data[None, ...]),    # Add 1D in front of the data to fit the dictionnary format (time)
+                "mask": (["sample", "y", "x"], mask_data[None, ...])
             },
             coords={
-                "time":[np.datetime64(timestamp)],
+                "sample_id": [sample_id],
+                "time":("sample", np.datetime64(timestamp)),
+                "roi_name": ("sample", [roi_name]),
                 "channel": ["VIS006", "VIS008", "IR_016"],
-                "y": np.arrange(self.shape[0]),
-                "x": np.arrange(self.shape[1])
+                "y": np.arange(self.shape[0]),
+                "x": np.arange(self.shape[1])
             }
         )
 
         mode = "a" if os.path.exists(self.zarr_path) else "w"   # Append if file already exists and write otherwise (create)
-        kwargs = {"append_dim": "time"} if mode == "a" else {}  # Add data by enlarging the time dimension
+        kwargs = {"append_dim": "sample"} if mode == "a" else {}  # Add data by enlarging the time dimension
 
         ds.to_zarr(self.zarr_path, mode=mode, **kwargs)
 
