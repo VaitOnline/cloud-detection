@@ -3,7 +3,7 @@ import os
 import zipfile
 import glob
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from satpy import Scene
 from pyresample.geometry import create_area_def
 
@@ -72,6 +72,65 @@ def cleanup_dir(self, dir_path: str):
         for file_path in glob.glob(os.path.join(dir_path, "*")):
             if os.path.isfile(file_path):   #Verify that the target is a file
                 os.remove(file_path)
+
+def proces_clm(self, clm_zip_path: str) -> Tuple[bool, float, Optional[np.array]]:
+    """
+    Decompress the GRIB format Cloud Mask, resample it and evaluate the cloud coverage.
+    It makes use of the Satpy 'eum_l2_grib'.
+    """
+
+    work_dir = self.extract_zip(clm_zip_path, "clm_work")
+    grb_files = glob.glob(os.path.join(work_dir, "*.grb"))
+
+    if not grb_files:
+        self.cleanup_dir(work_dir)
+        raise FileNotFoundError(f"No GRIB (.grb) files found in: {clm_zip_path}")
+
+    scene_clm = Scene(reader="eum_l2_grib", filenames=[grb_files[0]])
+    var_names = scene_clm.available_dataset_names()[0]
+    scene_clm.load([var_names])
+
+    # Resample to the nearest neighbour to preserve the classes
+    # If it were to be done by interpolation, we would lose the boolean property of the mask
+
+    aligned_clm = self.resampler.resample(scene_clm, resampler="nearest")
+    clm_array = aligned_clm[var_names].values
+    self.cleanup_dir(work_dir)
+
+    # 0, 1 are clear surface over land and see || 2, 3 are cloudy or un processed
+    # Binarisation
+    binary_mask = (clm_array >= 2).astype(np.utin8)
+    cloud_coverage = float(np.nanmean(binary_mask))
+
+    if cloud_coverage >= self.min_cloud_coverage:
+        return True, cloud_coverage, binary_mask
+
+    return False, cloud_coverage, None
+
+
+def process_seviri(self, seviri_path: str) -> np.ndarray:
+    """
+    Decompress, load and resample the spectral channels of SEVIRI.
+    It makes use of the Satpy 'seviri_l1b_native'.
+    """
+
+    channels = ["VIS006", "VIS008", "IR_016"]
+    scene_sev = Scene(reader="seviri_l1b_native", filenames=[seviri_path])
+    scene_sev.load(channels)
+
+    # Bilinear resampling for continuous data
+    aligned_sev = self.resampler.resample(scene_sev, resampler="bilinear")
+
+    vis006 = aligned_sev["VIS006"].values.astype(np.float32)
+    vis008 = aligned_sev["VIS008"].values.astype(np.float32)
+    ir016 = aligned_sev["IR_016"].values.astype(np.float32)
+
+    # Final shape: (3, 15, 15)
+    return np.stack([vis006, vis008, ir016])
+
+
+
+
 
 
 
