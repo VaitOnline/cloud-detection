@@ -55,103 +55,104 @@ class EumetsatZarrPipeline:
         os.makedirs(self.temp_path, exist_ok=True)
         os.makedirs(self.zarr_path, exist_ok=True)
 
-def extract_zip(self, zip_path: str, subfolder_name: str) -> str:
-    """
-    Decompress a EUMETSAT archive zip file in the local temporary folder.
-    """
-    target_path = os.path.join(self.temp_path, subfolder_name)
-    os.makedirs(target_path, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(target_path)
-    return target_path
 
-def cleanup_dir(self, dir_path: str):
-    """
-    Clean the target folder to preserve disk storage.
-    """
-    if os.path.exists(dir_path):
-        for file_path in glob.glob(os.path.join(dir_path, "*")):
-            if os.path.isfile(file_path):   #Verify that the target is a file
-                os.remove(file_path)
+    def extract_zip(self, zip_path: str, subfolder_name: str) -> str:
+        """
+        Decompress a EUMETSAT archive zip file in the local temporary folder.
+        """
+        target_path = os.path.join(self.temp_path, subfolder_name)
+        os.makedirs(target_path, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(target_path)
+        return target_path
 
-def proces_clm(self, clm_zip_path: str) -> Tuple[bool, float, Optional[np.array]]:
-    """
-    Decompress the GRIB format Cloud Mask, resample it and evaluate the cloud coverage.
-    It makes use of the Satpy 'eum_l2_grib'.
-    """
+    def cleanup_dir(self, dir_path: str):
+        """
+        Clean the target folder to preserve disk storage.
+        """
+        if os.path.exists(dir_path):
+            for file_path in glob.glob(os.path.join(dir_path, "*")):
+                if os.path.isfile(file_path):   #Verify that the target is a file
+                    os.remove(file_path)
 
-    work_dir = self.extract_zip(clm_zip_path, "clm_work")
-    grb_files = glob.glob(os.path.join(work_dir, "*.grb"))
+    def proces_clm(self, clm_zip_path: str) -> Tuple[bool, float, Optional[np.array]]:
+        """
+        Decompress the GRIB format Cloud Mask, resample it and evaluate the cloud coverage.
+        It makes use of the Satpy 'eum_l2_grib'.
+        """
 
-    if not grb_files:
+        work_dir = self.extract_zip(clm_zip_path, "clm_work")
+        grb_files = glob.glob(os.path.join(work_dir, "*.grb"))
+
+        if not grb_files:
+            self.cleanup_dir(work_dir)
+            raise FileNotFoundError(f"No GRIB (.grb) files found in: {clm_zip_path}")
+
+        scene_clm = Scene(reader="eum_l2_grib", filenames=[grb_files[0]])
+        var_names = scene_clm.available_dataset_names()[0]
+        scene_clm.load([var_names])
+
+        # Resample to the nearest neighbour to preserve the classes
+        # If it were to be done by interpolation, we would lose the boolean property of the mask
+
+        aligned_clm = self.resampler.resample(scene_clm, resampler="nearest")
+        clm_array = aligned_clm[var_names].values
         self.cleanup_dir(work_dir)
-        raise FileNotFoundError(f"No GRIB (.grb) files found in: {clm_zip_path}")
 
-    scene_clm = Scene(reader="eum_l2_grib", filenames=[grb_files[0]])
-    var_names = scene_clm.available_dataset_names()[0]
-    scene_clm.load([var_names])
+        # 0, 1 are clear surface over land and see || 2, 3 are cloudy or un processed
+        # Binarisation
+        binary_mask = (clm_array >= 2).astype(np.utin8)
+        cloud_coverage = float(np.nanmean(binary_mask))
 
-    # Resample to the nearest neighbour to preserve the classes
-    # If it were to be done by interpolation, we would lose the boolean property of the mask
+        if cloud_coverage >= self.min_cloud_coverage:
+            return True, cloud_coverage, binary_mask
 
-    aligned_clm = self.resampler.resample(scene_clm, resampler="nearest")
-    clm_array = aligned_clm[var_names].values
-    self.cleanup_dir(work_dir)
-
-    # 0, 1 are clear surface over land and see || 2, 3 are cloudy or un processed
-    # Binarisation
-    binary_mask = (clm_array >= 2).astype(np.utin8)
-    cloud_coverage = float(np.nanmean(binary_mask))
-
-    if cloud_coverage >= self.min_cloud_coverage:
-        return True, cloud_coverage, binary_mask
-
-    return False, cloud_coverage, None
+        return False, cloud_coverage, None
 
 
-def process_seviri(self, seviri_path: str) -> np.ndarray:
-    """
-    Decompress, load and resample the spectral channels of SEVIRI.
-    It makes use of the Satpy 'seviri_l1b_native'.
-    """
+    def process_seviri(self, seviri_path: str) -> np.ndarray:
+        """
+        Decompress, load and resample the spectral channels of SEVIRI.
+        It makes use of the Satpy 'seviri_l1b_native'.
+        """
 
-    channels = ["VIS006", "VIS008", "IR_016"]
-    scene_sev = Scene(reader="seviri_l1b_native", filenames=[seviri_path])
-    scene_sev.load(channels)
+        channels = ["VIS006", "VIS008", "IR_016"]
+        scene_sev = Scene(reader="seviri_l1b_native", filenames=[seviri_path])
+        scene_sev.load(channels)
 
-    # Bilinear resampling for continuous data
-    aligned_sev = self.resampler.resample(scene_sev, resampler="bilinear")
+        # Bilinear resampling for continuous data
+        aligned_sev = self.resampler.resample(scene_sev, resampler="bilinear")
 
-    vis006 = aligned_sev["VIS006"].values.astype(np.float32)
-    vis008 = aligned_sev["VIS008"].values.astype(np.float32)
-    ir016 = aligned_sev["IR_016"].values.astype(np.float32)
+        vis006 = aligned_sev["VIS006"].values.astype(np.float32)
+        vis008 = aligned_sev["VIS008"].values.astype(np.float32)
+        ir016 = aligned_sev["IR_016"].values.astype(np.float32)
 
-    # Final shape: (3, 15, 15)
-    return np.stack([vis006, vis008, ir016])
+        # Final shape: (3, 15, 15)
+        return np.stack([vis006, vis008, ir016])
 
 
-def append_sample(self, timestamp: str, image_data: np.ndarray, mask_data: np.ndarray):
-    """
-    Add the resampled and aligned data in the Zarr file.
-    """
+    def append_sample(self, timestamp: str, image_data: np.ndarray, mask_data: np.ndarray):
+        """
+        Add the resampled and aligned data in the Zarr file.
+        """
 
-    ds = xr.Dataset(
-        data_vars={
-            "image": (["time", "channel", "y", "x"], image_data[None, ...]),    # Add 1D in front of the data to fit the dictionnary format (time)
-            "mask": (["time", "y", "x"], mask_data[None, ...])
-        },
-        coords={
-            "time":[np.datetime64(timestamp)],
-            "channel": ["VIS006", "VIS008", "IR_016"],
-            "y": np.arrange(self.shape[0]),
-            "x": np.arrange(self.shape[1])
-        }
-    )
+        ds = xr.Dataset(
+            data_vars={
+                "image": (["time", "channel", "y", "x"], image_data[None, ...]),    # Add 1D in front of the data to fit the dictionnary format (time)
+                "mask": (["time", "y", "x"], mask_data[None, ...])
+            },
+            coords={
+                "time":[np.datetime64(timestamp)],
+                "channel": ["VIS006", "VIS008", "IR_016"],
+                "y": np.arrange(self.shape[0]),
+                "x": np.arrange(self.shape[1])
+            }
+        )
 
-    mode = "a" if os.path.exists(self.zarr_path) else "w"   # Append if file already exists and write otherwise (create)
-    kwargs = {"append_dim": "time"} if mode == "a" else {}  # Add data by enlarging the time dimension
+        mode = "a" if os.path.exists(self.zarr_path) else "w"   # Append if file already exists and write otherwise (create)
+        kwargs = {"append_dim": "time"} if mode == "a" else {}  # Add data by enlarging the time dimension
 
-    ds.to_zarr(self.zarr_path, mode=mode, **kwargs)
+        ds.to_zarr(self.zarr_path, mode=mode, **kwargs)
 
 
 
