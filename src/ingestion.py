@@ -1,19 +1,24 @@
-import numpy as np
-import os
-import zipfile
 import glob
+import os
+import shutil
+import zipfile
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+ 
+import numpy as np
 import xarray as xr
-
-from typing import List, Tuple, Optional
-from satpy import Scene
 from pyresample.geometry import create_area_def
+from satpy import Scene
 
 
+SEVIRI_CHANNELS = ["VIS006", "VIS008", "IR_016"]
+
+ClmResult = Tuple[bool, float, Optional[np.ndarray]]
 
 
 class SpatialResampler:
     """
-    Deals with the reprojection and resampling of a Satpy Scene and store the result in a zarr file.
+    Reprojects a Satpy Scene onto a regular lon/lat grid covering one ROI.
     """
 
     def __init__(self, bbox: List[float], shape: Tuple[int,int]=(512,512), crs: str="EPSG:4326", area_id: str="target_roi"):
@@ -38,138 +43,181 @@ class SpatialResampler:
 
 class EumetsatZarrPipeline:
     """
-    Pipeline to extract, filter, resample and archive a given ROI from and image into local Zarr files.
+    Extracts, resample and archives ROIs from EUMETSAT products into Zarr stores.
+
+    One spatial resampler is build for each ROI. Each product (CLM or SEVIRI) is extracted and read once, then resampled for every requested ROI.
     """
 
-    def __init__(self, zarr_path: str, bbox: List[float], shape: Tuple[int,int]=(512,512), min_cloud_cover: float=0.20, temp_dir: str="temp", area_id: str="roi"):
+    def __init__(self, rois:List[dict], shape: Tuple[int,int]=(512,512), min_cloud_cover: float=0.20, temp_dir: str="temp"):
         self.min_cloud_cover = min_cloud_cover
-        self.shape = shape
-        self.resampler = SpatialResampler(bbox=bbox, shape=shape, area_id=area_id)
-
-        # Creation of files on local storage
-        base_path = os.getenv("DATA_DIR", "./default_data_temp")
-
-        self.temp_path = os.path.join(base_path,temp_dir)
-        self.zarr_path = os.path.join(base_path,zarr_path)
-
+        self.shape = tuple(shape)
+        self.temp_path = temp_dir
         os.makedirs(self.temp_path, exist_ok=True)
-        os.makedirs(self.zarr_path, exist_ok=True)
 
+        # We initialize one Resampler per ROI keyed by the roi name
+        self.resamplers: Dict[str, SpatialResampler] = {
+            roi["name"]: SpatialResampler(
+                bbox=roi["bbox"], shape=self.shape, area_id=roi["name"]
+            )
+            for roi in rois
+        }
+
+    #============================
+    #          FILE            ||
+    #============================
 
     def extract_zip(self, zip_path: str, subfolder_name: str) -> str:
         """
-        Decompress a EUMETSAT archive zip file in the local temporary folder.
+        Extract a zip into a clean subfolder of the temporary directory.
         """
         target_path = os.path.join(self.temp_path, subfolder_name)
+        self.cleanup_dir(target_path)
+        
         os.makedirs(target_path, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(target_path)
         return target_path
 
-    def cleanup_dir(self, dir_path: str):
+    @staticmethod
+    def cleanup_dir(dir_path: str):
         """
-        Clean the target folder to preserve disk storage.
+        Remove a folder and everything inside it (files and subfolders).
         """
         if os.path.exists(dir_path):
-            for file_path in glob.glob(os.path.join(dir_path, "*")):
-                if os.path.isfile(file_path):   #Verify that the target is a file
-                    os.remove(file_path)
+            shutil.rmtree(dir_path, ignore_errors=True)
 
-    def proces_clm(self, clm_zip_path: str) -> Tuple[bool, float, Optional[np.array]]:
+    @staticmethod
+    def find_files(root: str, patterns: Tuple[str, ...]) -> List[str]:
+        found = []
+        for pattern in patterns:
+            found += glob.glob(os.path.join(root, "**", pattern), recursive=True)
+        return sorted(found)
+
+    def process_clm(self, clm_zip_path: str, roi_names: List[str]) -> Dict[str, ClmResult]:
         """
-        Decompress the GRIB format Cloud Mask, resample it and evaluate the cloud coverage.
-        It makes use of the Satpy 'eum_l2_grib'.
+        Extract the GRIB cloud mask once, then for each ROI resample (nearest neighbour to keep the classes), binarise and compute the cloud cover.
+
+        Binary mask: 1 = cloudy / unprocessed / no data, 0 = clear.
+        ROI is valide when its cloud cover is >= min_cloud_cover.
         """
 
         work_dir = self.extract_zip(clm_zip_path, "clm_work")
-        grb_files = glob.glob(os.path.join(work_dir, "*.grb"))
 
-        if not grb_files:
+        try:
+            grb_files = self.find_files(work_dir, ("*.grb", "*.grib", "*.grb2"))
+            if not grb_files:
+                raise FileNotFoundError(f"No GRIB file found in: {clm_zip_path}")
+
+            scene_clm = Scene(reader="eum_l2_grib", filenames=[grb_files[0]])
+            var_names = scene_clm.available_dataset_names()[0]
+            scene_clm.load([var_names])
+
+            results = {}
+            for roi_name in roi_names:
+                try:
+                    aligned = self.resamplers[roi_name].resample(scene_clm, resampler="nearest")
+                    clm_array = np.asarray(aligned[var_names].values, dtype=np.float64)
+
+                    binary_mask = (np.isnan(clm_array) | (clm_array >= 2)).astype(np.uint8)
+                    cloud_cover = float(binary_mask.mean())
+
+                    is_valid = cloud_cover>=self.min_cloud_cover
+                    results[roi_name] = (is_valid, cloud_cover, binary_mask if is_valid else None)
+
+                except Exception as e:
+                    print(f"       [ERROR CLM] ROI {roi_name}: {e}")
+                    results[roi_name] = (False, float("nan"), None)
+
+            return results
+    
+        finally:
             self.cleanup_dir(work_dir)
-            raise FileNotFoundError(f"No GRIB (.grb) files found in: {clm_zip_path}")
-
-        scene_clm = Scene(reader="eum_l2_grib", filenames=[grb_files[0]])
-        var_names = scene_clm.available_dataset_names()[0]
-        scene_clm.load([var_names])
-
-        # Resample to the nearest neighbour to preserve the classes
-        # If it were to be done by interpolation, we would lose the boolean property of the mask
-
-        aligned_clm = self.resampler.resample(scene_clm, resampler="nearest")
-        clm_array = aligned_clm[var_names].values
-        self.cleanup_dir(work_dir)
-
-        # 0, 1 are clear surface over land and see || 2, 3 are cloudy or un processed
-        # Binarisation
-        binary_mask = (clm_array >= 2).astype(np.utin8)
-        cloud_coverage = float(np.nanmean(binary_mask))
-
-        if cloud_coverage >= self.min_cloud_coverage:
-            return True, cloud_coverage, binary_mask
-
-        return False, cloud_coverage, None
 
 
-    def process_seviri(self, seviri_path: str) -> np.ndarray:
+
+    def process_seviri(self, seviri_zip_path: str, roi_names: List[str]) -> Dict[str, np.ndarray]:
         """
-        Decompress, load and resample the spectral channels of SEVIRI.
-        It makes use of the Satpy 'seviri_l1b_native'.
+        Extract the SEVIRI native data once, load the channels once, then resample (bilinear) for each ROI. 
+        Returns {roi_name: array (3, H, W)}.
         """
+        work_dir = self.extract_zip(seviri_zip_path, "seviri_work")
+        try:
+            nat_files = self.find_files(work_dir, ("*.nat",))       # The additional , is to be sure that python takes it as a singleton
+            if not nat_files:
+                raise FileNotFoundError(f"No .nat files found in: {seviri_zip_path}")
 
-        channels = ["VIS006", "VIS008", "IR_016"]
-        scene_sev = Scene(reader="seviri_l1b_native", filenames=[seviri_path])
-        scene_sev.load(channels)
+            scene = Scene(reader="seviri_l1b_native", filenames=[nat_files[0]])
+            scene.load(SEVIRI_CHANNELS)
 
-        # Bilinear resampling for continuous data
-        aligned_sev = self.resampler.resample(scene_sev, resampler="bilinear")
+            results = {}
+            for roi_name in roi_names:
+                try:
+                    aligned = self.resamplers[roi_name].resample(scene, resampler="bilinear")
+                    bands = [aligned[ch].values.astype(np.float32) for ch in SEVIRI_CHANNELS]
+                    results[roi_name] = np.stack(bands)     # (3, H, W)
+                except Exception as e:
+                    print(f"    [ERROR SEVIRI] ROI {roi_name}: {e}")
 
-        vis006 = aligned_sev["VIS006"].values.astype(np.float32)
-        vis008 = aligned_sev["VIS008"].values.astype(np.float32)
-        ir016 = aligned_sev["IR_016"].values.astype(np.float32)
-
-        # Final shape: (3, 15, 15)
-        return np.stack([vis006, vis008, ir016])
+            return results
+        finally:
+            self.cleanup_dir(work_dir)
 
 
-    def append_sample(self, timestamp: str,roi_name: str, image_data: np.ndarray, mask_data: np.ndarray):
+    #======================================
+    #               ZARR                 ||   
+    #======================================
+    @staticmethod
+    def make_sample_id(timestamp:datetime, roi_name:str) -> str:
+        return f"{timestamp.strftime('%Y%m%dT%H%M%S')}_{roi_name}"
+
+    @staticmethod
+    def zarr_exists(zarr_path:str) -> bool:
+        return os.path.isdir(zarr_path) and len(os.listdir(zarr_path)) > 0
+
+    def sample_exists(self, zarr_path: str, sample_id: str) -> bool:
         """
-        Add the resampled and aligned data in the Zarr file.
+        True if the sample is already stored.
         """
+        if not self.zarr_exists(zarr_path):
+            return False
+        with xr.open_zarr(zarr_path, consolidated=False) as ds:
+            return sample_id in ds["sample_id"].values
 
-        sample_id = f"{timestamp}_{roi_name}"
+    def append_sample(self, zarr_path: str, timestamp: datetime, roi_name: str, image_data: np.ndarray, mask_data: np.ndarray):
+        """
+        Append one (image, mask) sample to the Zarr file, creating it if necessary.
+        """
+        sample_id = self.make_sample_id(timestamp, roi_name)
+        ts = np.datetime64(timestamp.replace(tzinfo=None), "ns")        # Convert datetime into numpy without timezone
+        height, width = mask_data.shape
 
         ds = xr.Dataset(
             data_vars={
-                "image": (["sample", "channel", "y", "x"], image_data[None, ...]),    # Add 1D in front of the data to fit the dictionnary format (time)
-                "mask": (["sample", "y", "x"], mask_data[None, ...])
+                "image": (
+                    ("sample", "channel", "y", "x"),
+                    image_data[None, ...].astype(np.float32)
+                ),
+                "mask": (
+                    ("sample", "y", "x"),
+                         mask_data[None, ...].astype(np.uint8))
             },
             coords={
-                "sample_id": [sample_id],
-                "time":("sample", np.datetime64(timestamp)),
-                "roi_name": ("sample", [roi_name]),
-                "channel": ["VIS006", "VIS008", "IR_016"],
-                "y": np.arange(self.shape[0]),
-                "x": np.arange(self.shape[1])
+                "sample_id": ("sample", np.array([sample_id], dtype=object)),
+                "time": ("sample", np.array([ts], dtype="dataetime64[ns]")),
+                "roi_name": ("sample", np.array([roi_name], dtype=object)),
+                "channel": SEVIRI_CHANNELS,
+                "y": np.arange(height),
+                "x": np.arange(width)
             }
         )
 
-        mode = "a" if os.path.exists(self.zarr_path) else "w"   # Append if file already exists and write otherwise (create)
-        kwargs = {"append_dim": "sample"} if mode == "a" else {}  # Add data by enlarging the time dimension
-
-        ds.to_zarr(self.zarr_path, mode=mode, **kwargs)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        if self.zarr_exists(zarr_path):
+            # No encoding when appending 
+            ds.to_zarr(zarr_path, mode="a", append_dim="sample", consolidated=False)
+        else:
+            os.makedirs(os.path.dirname(zarr_path), exist_ok=True)
+            encoding = {
+                "image": {"chunks": (1, len(SEVIRI_CHANNELS), height, width)},
+                "mask": {"chunks": (1, height, width)}
+            }
+            ds.to_zarr(zarr_path, mode="w-", encoding=encoding, consolidated=False)
