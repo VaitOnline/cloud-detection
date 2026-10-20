@@ -5,7 +5,7 @@ import shutil
 import argparse
 
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Any
 from dotenv import load_dotenv
 
 from src.ingestion import EumetsatZarrPipeline
@@ -16,7 +16,7 @@ load_dotenv()
 
 BASE_DATA_DIR = os.getenv("DATA_DIR", "data")
 
-def get_datastore() -> eumdac.DataStore():
+def get_datastore() -> eumdac.DataStore:
     """
     Retrieve the key and secret from the .env file and set up the eumdac DataStore.
     """
@@ -25,7 +25,7 @@ def get_datastore() -> eumdac.DataStore():
 
     if not key or not secret:
         raise ValueError("EUMETSAT_CONSUMER_KEY or EUMETSAT_CONSUMER_SECRET missing from the .env file.")
-    token = eumdac.AccesToken(key, secret)
+    token = eumdac.AccessToken((key, secret))
     return eumdac.DataStore(token)
 
 
@@ -51,7 +51,7 @@ def download_product(product, dest_path: str) -> None:
         shutil.copyfileobj(frsc, fdst)
 
 
-def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: EumetsatZarrPipeline, rois: List[Dict], zarr_path: str, temp_dir: str):
+def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: EumetsatZarrPipeline, rois: List[Dict], zarr_paths: Dict[str, str], temp_dir: str):
     """
     Handle one single timestamp:
         - Download the CLM once
@@ -62,7 +62,7 @@ def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: Eumet
     """
     stamp = dt.strftime("%Y%m%d_%H%M%S")
     clm_zip = os.path.join(temp_dir, f"clm_{stamp}.zip")
-    sev_zip = os.path.join(temp_dir, "sev_{stamp}.zip")
+    sev_zip = os.path.join(temp_dir, f"sev_{stamp}.zip")
 
     try:
         # Download 1 CLM -> 1 read and N ROIs
@@ -74,10 +74,10 @@ def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: Eumet
             is_valid, cloud_cover, _ = clm_results[roi["name"]]
             if is_valid:
                 valid_rois.append(roi)
-                print(f"    [ROi {roi['name']} ({roi['group'].upper()})] valid ({cloud_cover *100:.1f}% clouds)")
+                print(f"    [ROI {roi['name']} ({roi['group'].upper()})] valid ({cloud_cover *100:.1f}% clouds)")
 
-            if not valid_rois:
-                return
+        if not valid_rois:
+            return
 
         # Seviri data downloaded only if at least one roi is valid
         results = seviri_collection.search(dtstart=dt-timedelta(minutes=1), dtend=dt+timedelta(minutes=1))
@@ -98,7 +98,7 @@ def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: Eumet
             _, _, mask = clm_results[name]
             try:
                 pipeline.append_sample(
-                    zarr_path=zarr_path,
+                    zarr_path=zarr_paths[group],
                     timestamp=dt,
                     roi_name=name,
                     image_data=images[name],
@@ -115,7 +115,7 @@ def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: Eumet
                 os.remove(path)
 
 
-def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/congif.yaml") -> None:
+def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/config.yaml") -> None:
     """
     - List the over each period and keep the targeted hours.
     - Download each CLM once and check the cloud cover on every ROIs.
@@ -128,7 +128,7 @@ def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/congif.
     outputs = config["outputs"]
     target_hours = config["target_hours"]
     collections = config["collections"]
-    years = config["years"]
+    years = pipe_config["years"]
     seasons = config["season_ranges"]
     shape = tuple(pipe_config["shape"])
     min_cloud_cover = pipe_config["min_cloud_cover"]
@@ -137,20 +137,20 @@ def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/congif.
     temp_dir = os.path.join(BASE_DATA_DIR, pipe_config.get("temp_dir", "temp"))
 
     zarr_paths = {
-        "train": os.path.join(BASE_DATA_DIR, outputs["train"]),
-        "test": os.path.join(BASE_DATA_DIR, outputs["test"])
+        "train": os.path.join(BASE_DATA_DIR, outputs["train_zarr"]),
+        "test": os.path.join(BASE_DATA_DIR, outputs["test_zarr"])
     }
     for roi in all_rois:
         if roi["group"] not in zarr_paths:
             raise ValueError(f"ROI {roi['name']}: unknown group '{roi['group']}' (expected train/test)")
 
     print("\n" + "="*50)
-    print(f"Zarr train path: {zarr_paths["train"]}")
+    print(f"Zarr train path: {zarr_paths['train']}")
     print(f"Zarr test path: {zarr_paths['test']}")
     print("\n" + "="*50)
 
-    clm_collection = datastore.get_datastore(collections["cloud"])
-    seviri_collection = datastore.get_datastore(collections["data"])
+    clm_collection = datastore.get_collection(collections["cloud"])
+    seviri_collection = datastore.get_collection(collections["data"])
 
     pipeline = EumetsatZarrPipeline(
         rois=all_rois, shape=shape, min_cloud_cover=min_cloud_cover, temp_dir=temp_dir
@@ -163,7 +163,7 @@ def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/congif.
             print(f"\n Period: {season['name']} ({start_s} to {end_s})")
 
             dt_start = datetime.fromisoformat(f"{start_s}T00:00:00")
-            dt_end = datetime.fromisoformat(f"{end_s}T:23:59:59")
+            dt_end = datetime.fromisoformat(f"{end_s}T23:59:59")
 
             # Full-disk product so all rois are contained in one product
             clm_products = {}
@@ -202,4 +202,4 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to the YAML config")
     args = parser.parse_args()
 
-    run_pipeline(get_datastore, config_path=args.config)
+    run_pipeline(get_datastore(), config_path=args.config)

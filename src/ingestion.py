@@ -203,7 +203,7 @@ class EumetsatZarrPipeline:
             },
             coords={
                 "sample_id": ("sample", np.array([sample_id], dtype=object)),
-                "time": ("sample", np.array([ts], dtype="dataetime64[ns]")),
+                "time": ("sample", np.array([ts], dtype="datetime64[ns]")),
                 "roi_name": ("sample", np.array([roi_name], dtype=object)),
                 "channel": SEVIRI_CHANNELS,
                 "y": np.arange(height),
