@@ -1,0 +1,40 @@
+collections:
+  cloud: "EO:EUM:DAT:MSG:CLM"
+  data: "EO:EUM:DAT:MSG:HRSEVIRI"
+
+
+pipeline:
+  min_cloud_coverage: 0.15
+  shape: [512,512]
+  temp_dir: "temp"
+  years: [2022, 2023, 2024]
+
+target_hours:
+  start_hour: 12
+  end_hour: 17
+
+
+outputs:
+  train_zarr: "zarr/train.zarr"
+  test_zarr: "zarr/test.zarr"
+
+rois:
+  - name: "libya_deep_sahara"
+    group: "train"
+    bbox: [16.0, 24.0, 23.0, 29.0]
+    
+  - name: "algeria_deep_sahara"
+    group: "train"
+    bbox: [5.0, 23.0, 12.0, 28.0]
+    
+  - name: "nubian_deep_desert"
+    group: "test"
+    bbox: [28.0, 20.0, 35.0, 25.0]
+    
+season_ranges:
+  - name: "spring_full"
+    start_md: "03-01"
+    end_md: "05-31"
+  - name: "autumn_full"
+    start_md: "09-15"
+    end_md: "11-30"
