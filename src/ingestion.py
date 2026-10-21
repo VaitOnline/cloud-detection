@@ -15,6 +15,15 @@ SEVIRI_CHANNELS = ["VIS006", "VIS008", "IR_016"]
 
 ClmResult = Tuple[bool, float, Optional[np.ndarray]]
 
+import warnings
+
+# No loss of important info here as we just have a classic long/lat grid
+warnings.filterwarnings(
+    "ignore",
+    message="You will likely lose important projection information",
+    category=UserWarning,
+)
+
 
 class SpatialResampler:
     """
@@ -108,7 +117,7 @@ class EumetsatZarrPipeline:
             if not grb_files:
                 raise FileNotFoundError(f"No GRIB file found in: {clm_zip_path}")
 
-            scene_clm = Scene(reader="eum_l2_grib", filenames=[grb_files[0]])
+            scene_clm = Scene(reader="seviri_l2_grib", filenames=[grb_files[0]])
             var_names = scene_clm.available_dataset_names()[0]
             scene_clm.load([var_names])
 
@@ -218,6 +227,7 @@ class EumetsatZarrPipeline:
             os.makedirs(os.path.dirname(zarr_path), exist_ok=True)
             encoding = {
                 "image": {"chunks": (1, len(SEVIRI_CHANNELS), height, width)},
-                "mask": {"chunks": (1, height, width)}
+                "mask": {"chunks": (1, height, width)},
+                "time": {"units": "seconds since 2000-01-01", "dtype": "int64"}
             }
             ds.to_zarr(zarr_path, mode="w-", encoding=encoding, consolidated=False)
