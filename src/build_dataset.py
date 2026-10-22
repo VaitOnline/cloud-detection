@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 from dotenv import load_dotenv
+from alive_progress import alive_bar
 
 from src.ingestion import EumetsatZarrPipeline
 
@@ -75,6 +76,8 @@ def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: Eumet
             if is_valid:
                 valid_rois.append(roi)
                 print(f"    [ROI {roi['name']} ({roi['group'].upper()})] valid ({cloud_cover *100:.1f}% clouds)")
+            else:
+                print(f"    [ROI {roi['name']} ({roi['group'].upper()})] NOT valid ({cloud_cover *100:.1f}% clouds)")
 
         if not valid_rois:
             return
@@ -110,6 +113,7 @@ def process_timestamp(dt: datetime, clm_prod, seviri_collection, pipeline: Eumet
                 print(f"    [ERROR ZARR] ROI {name} ({group}) at {dt.isoformat()}: {e}")
 
     finally:
+        print("\n")
         for path in (clm_zip, sev_zip):
             if os.path.exists(path):
                 os.remove(path)
@@ -144,10 +148,10 @@ def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/config.
         if roi["group"] not in zarr_paths:
             raise ValueError(f"ROI {roi['name']}: unknown group '{roi['group']}' (expected train/test)")
 
-    print("\n" + "="*50)
+    print("\n" + "="*100)
     print(f"Zarr train path: {zarr_paths['train']}")
     print(f"Zarr test path: {zarr_paths['test']}")
-    print("\n" + "="*50)
+    print("="*100)
 
     clm_collection = datastore.get_collection(collections["cloud"])
     seviri_collection = datastore.get_collection(collections["data"])
@@ -175,24 +179,25 @@ def run_pipeline(datastore: eumdac.DataStore, config_path: str = "config/config.
             except Exception as e:
                 print(f"    [ERROR API CLM] search failed: {e}")
 
-            print(f"    -> {len(clm_products)} timestamps to analyze.")
+    print(f"    -> {len(clm_products)} timestamps to analyze.\n")
 
-            for dt, clm_prod in sorted(clm_products.items()):
+    with alive_bar(len(clm_products), title="Timestamp", unit="ts", bar="smooth", spinner="triangles") as bar:
+        for dt, clm_prod in sorted(clm_products.items()):
                 # Skip the ROIs which are already stored so it is safe to re-run the script
                 pending = [
                     roi for roi in all_rois
                     if not pipeline.sample_exists(zarr_paths[roi["group"]], pipeline.make_sample_id(dt, roi["name"]))
                 ]
-                if not pending:
-                    continue
-
-                try:
-                    process_timestamp(
-                        dt, clm_prod, seviri_collection, pipeline,
-                        pending, zarr_paths, temp_dir
-                    )
-                except Exception as e:
-                    print(f"    [ERROR] {dt.isoformat()}: {e}")
+                
+                if pending:
+                    try:
+                        process_timestamp(
+                            dt, clm_prod, seviri_collection, pipeline,
+                            pending, zarr_paths, temp_dir
+                        )
+                    except Exception as e:
+                        print(f"    [ERROR] {dt.isoformat()}: {e}")
+                bar()
 
     print("\n Pipeline finished. Train and test Zarr are ready.")
 
